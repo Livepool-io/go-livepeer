@@ -198,6 +198,25 @@ func OptionalCapabilities() []Capability {
 	}
 }
 
+func AICapabilities() []Capability {
+	return []Capability{
+		Capability_TextToImage,
+		Capability_ImageToImage,
+		Capability_ImageToVideo,
+		Capability_Upscale,
+	}
+}
+
+func ContainsAICapabilities(caps *Capabilities) bool {
+	for cap, _ := range caps.capacities {
+		switch cap {
+		case Capability_TextToImage, Capability_ImageToImage, Capability_ImageToVideo, Capability_Upscale:
+			return true
+		}
+	}
+	return false
+}
+
 func MandatoryOCapabilities() []Capability {
 	// Add to this list as certain features become mandatory.
 	// Use sparingly, as adding to this is a hard break with older nodes
@@ -506,6 +525,19 @@ func (cap *Capabilities) AddCapacity(newCaps *Capabilities) {
 		}
 		cap.bitstring[arrIdx] |= uint64(1 << bitIdx)
 	}
+
+	for capability, constraints := range newCaps.constraints {
+		if cap.constraints[capability] == nil {
+			cap.constraints[capability] = constraints
+		} else {
+			for modelID, modelConstraint := range constraints.Models {
+				if cap.constraints[capability].Models[modelID] == nil {
+					// TODO: this re-writes Warm; check
+					cap.constraints[capability].Models[modelID] = modelConstraint
+				}
+			}
+		}
+	}
 }
 
 func (cap *Capabilities) RemoveCapacity(goneCaps *Capabilities) {
@@ -522,6 +554,15 @@ func (cap *Capabilities) RemoveCapacity(goneCaps *Capabilities) {
 			cap.bitstring.removeCapability(capability)
 		} else {
 			cap.capacities[capability] = newCapacity
+		}
+	}
+
+	for capability, constraints := range goneCaps.constraints {
+		if cap.constraints[capability] == nil {
+			continue
+		}
+		for modelID := range constraints.Models {
+			delete(cap.constraints[capability].Models, modelID)
 		}
 	}
 }
