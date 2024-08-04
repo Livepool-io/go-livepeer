@@ -17,6 +17,9 @@ service Transcoder {
   // Called by the transcoder to register to an orchestrator. The orchestrator
   // notifies registered transcoders of segments as they come in.
   rpc RegisterTranscoder(RegisterRequest) returns (stream NotifySegment);
+  // Called by the transcoder to register a `RemoteAIWorker` worker to an orchestrator
+  // notifies the registered `RemoteAIWorker` of AI jobs as they come in.
+  rpc RegisterAIWorker(RegisterRequest) returns (stream NotifyAIJob);
 }
 
 message PingPong {
@@ -108,8 +111,17 @@ message Capabilities {
     // Capacity corresponding to each capability
     map<uint32, uint32> capacities = 3;
 
-    // Non-binary capability constraints, such as supported ranges.
+    string version = 4;
+
+    Constraints constraints = 5;
+
+    // Non-binary general constraints.
     message Constraints {
+      string minVersion = 1;
+    }
+
+    // Non-binary capability constraints, such as supported ranges.
+    message CapabilityConstraints {
       message ModelConstraint {
         bool warm = 1;
       }
@@ -117,7 +129,7 @@ message Capabilities {
       map<string, ModelConstraint> models = 1; 
     }
 
-    map<uint32, Constraints> constraints = 4;
+    map<uint32, CapabilityConstraints> capabilityConstraints = 6;
 }
 
 // The orchestrator sends this in response to `GetOrchestrator`, containing
@@ -356,6 +368,20 @@ message NotifySegment {
 
     // Deprecated by segData. Transcoding configuration to use.
     reserved 33; // Formerly "repeated VideoProfile fullProfiles"
+}
+
+enum AIRequestType {
+  TextToImage= 0;
+  ImageToImage= 1;
+  ImageToVideo= 2;
+  Upscale = 3;
+  AudioToText = 4;
+}
+// Sent by the orchestrator to the remote AI worker
+message NotifyAIJob {
+  AIRequestType type = 1;
+  int64 taskID = 2;
+  bytes data = 3; // json
 }
 
 // Required parameters for probabilistic micropayment tickets

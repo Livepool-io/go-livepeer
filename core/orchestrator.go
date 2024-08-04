@@ -95,6 +95,8 @@ func (orch *orchestrator) CheckCapacity(mid ManifestID) error {
 
 // CheckAICapacity verifies if the orchestrator can process a request for a specific pipeline and modelID.
 func (orch *orchestrator) CheckAICapacity(pipeline, modelID string) bool {
+	// TODO: Pass cap instead? Considering it's a public function might be
+	// better to pass the string directly
 	return orch.node.AIWorker.HasCapacity(pipeline, modelID)
 }
 
@@ -108,6 +110,14 @@ func (orch *orchestrator) ServeTranscoder(stream net.Transcoder_RegisterTranscod
 
 func (orch *orchestrator) TranscoderResults(tcID int64, res *RemoteTranscoderResult) {
 	orch.node.TranscoderManager.transcoderResults(tcID, res)
+}
+
+func (orch *orchestrator) ServeRemoteAIWorker(stream net.Transcoder_RegisterAIWorkerServer, capabilities *net.Capabilities) {
+	orch.node.serveRemoteAIWorker(stream, capabilities)
+}
+
+func (orch *orchestrator) AIResult(res *RemoteAIWorkerResult) {
+	orch.node.AIManager.aiResult(res)
 }
 
 func (orch *orchestrator) TextToImage(ctx context.Context, req worker.TextToImageJSONRequestBody) (*worker.ImageResponse, error) {
@@ -127,7 +137,7 @@ func (orch *orchestrator) Upscale(ctx context.Context, req worker.UpscaleMultipa
 }
 
 func (orch *orchestrator) AudioToText(ctx context.Context, req worker.AudioToTextMultipartRequestBody) (*worker.TextResponse, error) {
-	return orch.node.AudioToText(ctx, req)
+	return orch.node.audioToText(ctx, req)
 }
 
 func (orch *orchestrator) ProcessPayment(ctx context.Context, payment net.Payment, manifestID ManifestID) error {
@@ -350,7 +360,7 @@ func (orch *orchestrator) priceInfo(sender ethcommon.Address, manifestID Manifes
 		for cap := range caps.Capacities {
 			// If the capability does not have constraints (and thus any model constraints) skip it
 			// because we only price a capability together with a model ID right now
-			constraints, ok := caps.Constraints[cap]
+			constraints, ok := caps.CapabilityConstraints[cap]
 			if !ok {
 				continue
 			}
@@ -918,6 +928,17 @@ func (n *LivepeerNode) endTranscodingSession(sessionId string, logCtx context.Co
 	}
 }
 
+func (n *LivepeerNode) serveRemoteAIWorker(stream net.Transcoder_RegisterAIWorkerServer, capabilities *net.Capabilities) {
+	from := common.GetConnectionAddr(stream.Context())
+	n.Capabilities.AddCapacity(CapabilitiesFromNetCapabilities(capabilities))
+	defer n.Capabilities.RemoveCapacity(CapabilitiesFromNetCapabilities(capabilities))
+
+	// Blocks while AIWorker is connected
+	n.AIManager.Manage(stream, capabilities)
+	glog.V(common.DEBUG).Infof("Closing AIWorker=%s channel", from)
+
+}
+
 func (n *LivepeerNode) serveTranscoder(stream net.Transcoder_RegisterTranscoderServer, capacity int, capabilities *net.Capabilities) {
 	from := common.GetConnectionAddr(stream.Context())
 	coreCaps := CapabilitiesFromNetCapabilities(capabilities)
@@ -949,7 +970,7 @@ func (n *LivepeerNode) upscale(ctx context.Context, req worker.UpscaleMultipartR
 	return n.AIWorker.Upscale(ctx, req)
 }
 
-func (n *LivepeerNode) AudioToText(ctx context.Context, req worker.AudioToTextMultipartRequestBody) (*worker.TextResponse, error) {
+func (n *LivepeerNode) audioToText(ctx context.Context, req worker.AudioToTextMultipartRequestBody) (*worker.TextResponse, error) {
 	return n.AIWorker.AudioToText(ctx, req)
 }
 
@@ -1263,7 +1284,9 @@ func (rtm *RemoteTranscoderManager) selectTranscoder(sessionId string, caps *Cap
 	findCompatibleTranscoder := func(rtm *RemoteTranscoderManager) int {
 		for i := len(rtm.remoteTranscoders) - 1; i >= 0; i-- {
 			// no capabilities = default capabilities, all transcoders must support them
-			if caps == nil || caps.bitstring.CompatibleWith(rtm.remoteTranscoders[i].capabilities.bitstring) {
+			if caps == nil ||
+				(caps.bitstring.CompatibleWith(rtm.remoteTranscoders[i].capabilities.bitstring) &&
+					caps.LivepeerVersionCompatibleWith(rtm.remoteTranscoders[i].capabilities.ToNetCapabilities())) {
 				return i
 			}
 		}
@@ -1315,7 +1338,7 @@ func (node *RemoteTranscoderManager) EndTranscodingSession(sessionId string) {
 	panic("shouldn't be called on RemoteTranscoderManager")
 }
 
-// completeStreamSessions end a stream session for a remote transcoder and decrements its load
+// completeStreamSession end a stream session for a remote transcoder and decrements its load
 // caller should hold the mutex lock
 func (rtm *RemoteTranscoderManager) completeStreamSession(sessionId string) {
 	t, ok := rtm.streamSessions[sessionId]
