@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +29,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 
+	"github.com/livepeer/ai-worker/worker"
 	"github.com/livepeer/go-livepeer/clog"
 	"github.com/livepeer/go-livepeer/common"
 	"github.com/livepeer/go-livepeer/core"
@@ -47,7 +49,7 @@ var errCapabilities = errors.New("incompatible segment capabilities")
 
 // RunTranscoder is main routing of standalone transcoder
 // Exiting it will terminate executable
-func RunTranscoder(n *core.LivepeerNode, orchAddr string, capacity int, caps []core.Capability) {
+func RunTranscoder(n *core.LivepeerNode, orchAddr string, capacity int, caps *core.Capabilities) {
 	expb := backoff.NewExponentialBackOff()
 	expb.MaxInterval = time.Minute
 	expb.MaxElapsedTime = 0
@@ -81,7 +83,7 @@ func checkTranscoderError(err error) error {
 	return err
 }
 
-func runTranscoder(n *core.LivepeerNode, orchAddr string, capacity int, caps []core.Capability) error {
+func runTranscoder(n *core.LivepeerNode, orchAddr string, capacity int, caps *core.Capabilities) error {
 	tlsConfig := &tls.Config{InsecureSkipVerify: true}
 	conn, err := grpc.Dial(orchAddr,
 		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
@@ -96,46 +98,209 @@ func runTranscoder(n *core.LivepeerNode, orchAddr string, capacity int, caps []c
 	ctx, cancel := context.WithCancel(ctx)
 	// Silence linter
 	defer cancel()
-	r, err := c.RegisterTranscoder(ctx, &net.RegisterRequest{Secret: n.OrchSecret, Capacity: int64(capacity),
-		Capabilities: core.NewCapabilities(caps, []core.Capability{}).ToNetCapabilities()})
+
+	tR, err := c.RegisterTranscoder(ctx, &net.RegisterRequest{Secret: n.OrchSecret, Capacity: int64(capacity),
+		Capabilities: caps.ToNetCapabilities()})
 	if err := checkTranscoderError(err); err != nil {
 		glog.Error("Could not register transcoder to orchestrator ", err)
 		return err
+	}
+
+	var aiR net.Transcoder_RegisterAIWorkerClient
+	if core.ContainsAICapabilities(caps) {
+		aiR, err = c.RegisterAIWorker(ctx, &net.RegisterRequest{Secret: n.OrchSecret, Capacity: int64(capacity),
+			Capabilities: caps.ToNetCapabilities()})
+		// TODO: add checking AI errors to checkTranscoderError
+		if err := checkTranscoderError(err); err != nil {
+			glog.Error("Could not register AI worker to orchestrator ", err)
+			return err
+		}
 	}
 
 	// Catch interrupt signal to shut down transcoder
 	exitc := make(chan os.Signal)
 	signal.Notify(exitc, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(exitc)
+	defer close(exitc)
+
+	httpc := &http.Client{Transport: &http2.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	var wg sync.WaitGroup
+	errChan := make(chan error, 2)
+	// Channels to receive messages
+	tRChan := make(chan *net.NotifySegment)
+	aiRChan := make(chan *net.NotifyAIJob)
+
 	go func() {
+		defer close(tRChan)
+		for {
+			notify, err := tR.Recv()
+			if err != nil {
+				errChan <- err
+				return
+			}
+			tRChan <- notify
+		}
+
+	}()
+
+	go func() {
+		defer close(aiRChan)
+		for {
+			aiJob, err := aiR.Recv()
+
+			if err != nil {
+				errChan <- err
+				return
+			}
+			aiRChan <- aiJob
+		}
+	}()
+
+	for {
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case notify := <-tRChan:
+			if notify.SegData != nil && notify.SegData.AuthToken != nil && len(notify.SegData.AuthToken.SessionId) > 0 && len(notify.Url) == 0 {
+				// session teardown signal
+				n.Transcoder.EndTranscodingSession(notify.SegData.AuthToken.SessionId)
+			} else {
+				wg.Add(1)
+				go func() {
+					runTranscode(n, orchAddr, httpc, notify)
+					wg.Done()
+				}()
+			}
+		case aiJob := <-aiRChan:
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				runAIJob(ctx, aiJob, n, orchAddr, httpc)
+			}()
+		case err := <-errChan:
+			if err := checkTranscoderError(err); err != nil {
+				glog.Infof(`End of stream receive cycle because of err=%q, waiting for running transcode and ai jobs to complete`, err)
+				wg.Wait()
+				return err
+			}
 		case sig := <-exitc:
 			glog.Infof("Exiting Livepeer Transcoder: %v", sig)
 			// Cancelling context will close connection to orchestrator
 			cancel()
+			return nil
+		}
+	}
+}
+
+func runAIJob(ctx context.Context, aiJob *net.NotifyAIJob, n *core.LivepeerNode, orchAddr string, httpc *http.Client) {
+	// Process the transcoding job
+	select {
+	case <-ctx.Done():
+		glog.Info("Received cancellation signal err=%q", ctx.Err())
+		return
+	default:
+		if aiJob == nil {
 			return
 		}
-	}()
 
-	httpc := &http.Client{Transport: &http2.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
-	var wg sync.WaitGroup
-	for {
-		notify, err := r.Recv()
-		if err := checkTranscoderError(err); err != nil {
-			glog.Infof(`End of stream receive cycle because of err=%q, waiting for running transcode jobs to complete`, err)
-			wg.Wait()
-			return err
+		var aiResultBytes []byte
+		var err error
+
+		switch aiJob.Type {
+		case net.AIRequestType_TextToImage:
+			var req worker.TextToImageJSONRequestBody
+			var res *worker.ImageResponse
+			if err = json.Unmarshal(aiJob.Data, &req); err == nil {
+				glog.V(common.DEBUG).Infof("Text-to-Image AI Job received model=%v prompt=%v", req.ModelId, req.Prompt)
+				res, err = n.AIWorker.TextToImage(context.Background(), req)
+				if err == nil {
+					aiResultBytes, err = json.Marshal(res)
+				}
+			}
+		case net.AIRequestType_ImageToImage:
+			var req worker.ImageToImageMultipartRequestBody
+			var res *worker.ImageResponse
+			if err = json.Unmarshal(aiJob.Data, &req); err == nil {
+				glog.V(common.DEBUG).Infof("Image-to-Image AI Job received model=%v image=%v", req.ModelId, req.Image.Filename())
+				res, err = n.AIWorker.ImageToImage(context.Background(), req)
+				if err == nil {
+					aiResultBytes, err = json.Marshal(res)
+				}
+			}
+		case net.AIRequestType_Upscale:
+			var req worker.UpscaleMultipartRequestBody
+			var res *worker.ImageResponse
+			if err = json.Unmarshal(aiJob.Data, &req); err == nil {
+				glog.V(common.DEBUG).Infof("Upscale AI Job received model=%v image=%v", req.ModelId, req.Image.Filename())
+				res, err = n.AIWorker.Upscale(context.Background(), req)
+				if err == nil {
+					aiResultBytes, err = json.Marshal(res)
+				}
+			}
+		// TODO: apparently this uses imageReponse for now (?)
+		case net.AIRequestType_ImageToVideo:
+			var req worker.ImageToVideoMultipartRequestBody
+			var res *worker.VideoResponse
+			if err = json.Unmarshal(aiJob.Data, &req); err == nil {
+				glog.V(common.DEBUG).Infof("Image-to-Video AI Job received model=%v image=%v", req.ModelId, req.Image.Filename())
+				res, err = n.AIWorker.ImageToVideo(context.Background(), req)
+				if err == nil {
+					aiResultBytes, err = json.Marshal(res)
+				}
+			}
+		case net.AIRequestType_AudioToText:
+			var req worker.AudioToTextMultipartRequestBody
+			var res *worker.TextResponse
+			if err = json.Unmarshal(aiJob.Data, &req); err == nil {
+				glog.V(common.DEBUG).Infof("Audio-to-Text AI Job received model=%v audio=%v", req.ModelId, req.Audio.Filename())
+				res, err = n.AIWorker.AudioToText(context.Background(), req)
+				if err == nil {
+					aiResultBytes, err = json.Marshal(res)
+				}
+			}
+		default:
+			err = fmt.Errorf("Invalid Job type decoded taskID=%v type=%v", aiJob.TaskID, aiJob.Type)
+			glog.Error(err)
 		}
-		if notify.SegData != nil && notify.SegData.AuthToken != nil && len(notify.SegData.AuthToken.SessionId) > 0 && len(notify.Url) == 0 {
-			// session teardown signal
-			n.Transcoder.EndTranscodingSession(notify.SegData.AuthToken.SessionId)
-		} else {
-			wg.Add(1)
-			go func() {
-				runTranscode(n, orchAddr, httpc, notify)
-				wg.Done()
-			}()
+
+		var errString string
+		if err != nil {
+			glog.Errorf("AI job failed ID=%v err=%v", aiJob.TaskID, err)
+			errString = err.Error()
 		}
+
+		aiResult := &core.RemoteAIWorkerResult{
+			JobType: aiJob.Type,
+			TaskID:  aiJob.TaskID,
+			Bytes:   aiResultBytes,
+			Err:     errString,
+		}
+
+		// Create a bytes.Buffer and write the JSON data to it
+		var body bytes.Buffer
+		jsonAiResult, err := json.Marshal(aiResult)
+		if err != nil {
+			glog.Errorf("Error marshaling JSON err=%q", err)
+		}
+		body.Write(jsonAiResult)
+
+		// Post result back to orchestrator
+		req, err := http.NewRequest("POST", "https://"+orchAddr+"/aiResults", &body)
+		if err != nil {
+			glog.Errorf("Error posting results to orch=%s taskId=%d type=%s err=%q", orchAddr,
+				aiResult.TaskID, aiResult.JobType, err)
+			return
+		}
+		req.Header.Set("Authorization", protoVerLPT)
+		req.Header.Set("Credentials", n.OrchSecret)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := httpc.Do(req)
+		if err != nil {
+			glog.Errorf("Error submitting results err=%q", err)
+			return
+		}
+		defer resp.Body.Close()
 	}
 }
 
@@ -315,7 +480,58 @@ func (h *lphttp) RegisterTranscoder(req *net.RegisterRequest, stream net.Transco
 	return nil
 }
 
+func (h *lphttp) RegisterAIWorker(req *net.RegisterRequest, stream net.Transcoder_RegisterAIWorkerServer) error {
+	from := common.GetConnectionAddr(stream.Context())
+	glog.Infof("Got a RegisterAIWorker request from transcoder=%s capacity=%d", from, req.Capacity)
+
+	if req.Secret != h.orchestrator.TranscoderSecret() {
+		glog.Errorf("err=%q", errSecret.Error())
+		return errSecret
+	}
+	if req.Capacity <= 0 {
+		glog.Errorf("err=%q", errZeroCapacity.Error())
+		return errZeroCapacity
+	}
+	// handle
+	if req.Capabilities == nil {
+		// TODO: return error No AI capabilities
+	}
+	h.orchestrator.ServeRemoteAIWorker(stream, req.Capabilities)
+	return nil
+}
+
 // Orchestrator HTTP
+
+func (h *lphttp) AIWorkerResults(w http.ResponseWriter, r *http.Request) {
+	orch := h.orchestrator
+
+	authType := r.Header.Get("Authorization")
+	creds := r.Header.Get("Credentials")
+	if protoVerLPT != authType {
+		glog.Error("Invalid auth type ", authType)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if creds != orch.TranscoderSecret() {
+		glog.Error("Invalid shared secret")
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req core.RemoteAIWorkerResult
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondWithError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Err != "" {
+		respondWithError(w, req.Err, http.StatusInternalServerError)
+		return
+	}
+
+	orch.AIResult(&req)
+}
 
 func (h *lphttp) TranscodeResults(w http.ResponseWriter, r *http.Request) {
 	orch := h.orchestrator

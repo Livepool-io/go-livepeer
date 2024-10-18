@@ -95,6 +95,8 @@ func (orch *orchestrator) CheckCapacity(mid ManifestID) error {
 
 // CheckAICapacity verifies if the orchestrator can process a request for a specific pipeline and modelID.
 func (orch *orchestrator) CheckAICapacity(pipeline, modelID string) bool {
+	// TODO: Pass cap instead? Considering it's a public function might be
+	// better to pass the string directly
 	return orch.node.AIWorker.HasCapacity(pipeline, modelID)
 }
 
@@ -108,6 +110,14 @@ func (orch *orchestrator) ServeTranscoder(stream net.Transcoder_RegisterTranscod
 
 func (orch *orchestrator) TranscoderResults(tcID int64, res *RemoteTranscoderResult) {
 	orch.node.TranscoderManager.transcoderResults(tcID, res)
+}
+
+func (orch *orchestrator) ServeRemoteAIWorker(stream net.Transcoder_RegisterAIWorkerServer, capabilities *net.Capabilities) {
+	orch.node.serveRemoteAIWorker(stream, capabilities)
+}
+
+func (orch *orchestrator) AIResult(res *RemoteAIWorkerResult) {
+	orch.node.AIManager.aiResult(res)
 }
 
 func (orch *orchestrator) TextToImage(ctx context.Context, req worker.TextToImageJSONRequestBody) (*worker.ImageResponse, error) {
@@ -127,7 +137,7 @@ func (orch *orchestrator) Upscale(ctx context.Context, req worker.UpscaleMultipa
 }
 
 func (orch *orchestrator) AudioToText(ctx context.Context, req worker.AudioToTextMultipartRequestBody) (*worker.TextResponse, error) {
-	return orch.node.AudioToText(ctx, req)
+	return orch.node.audioToText(ctx, req)
 }
 
 func (orch *orchestrator) ProcessPayment(ctx context.Context, payment net.Payment, manifestID ManifestID) error {
@@ -918,6 +928,17 @@ func (n *LivepeerNode) endTranscodingSession(sessionId string, logCtx context.Co
 	}
 }
 
+func (n *LivepeerNode) serveRemoteAIWorker(stream net.Transcoder_RegisterAIWorkerServer, capabilities *net.Capabilities) {
+	from := common.GetConnectionAddr(stream.Context())
+	n.Capabilities.AddCapacity(CapabilitiesFromNetCapabilities(capabilities))
+	defer n.Capabilities.RemoveCapacity(CapabilitiesFromNetCapabilities(capabilities))
+
+	// Blocks while AIWorker is connected
+	n.AIManager.Manage(stream, capabilities)
+	glog.V(common.DEBUG).Infof("Closing AIWorker=%s channel", from)
+
+}
+
 func (n *LivepeerNode) serveTranscoder(stream net.Transcoder_RegisterTranscoderServer, capacity int, capabilities *net.Capabilities) {
 	from := common.GetConnectionAddr(stream.Context())
 	coreCaps := CapabilitiesFromNetCapabilities(capabilities)
@@ -949,7 +970,7 @@ func (n *LivepeerNode) upscale(ctx context.Context, req worker.UpscaleMultipartR
 	return n.AIWorker.Upscale(ctx, req)
 }
 
-func (n *LivepeerNode) AudioToText(ctx context.Context, req worker.AudioToTextMultipartRequestBody) (*worker.TextResponse, error) {
+func (n *LivepeerNode) audioToText(ctx context.Context, req worker.AudioToTextMultipartRequestBody) (*worker.TextResponse, error) {
 	return n.AIWorker.AudioToText(ctx, req)
 }
 
